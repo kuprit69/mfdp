@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LungPrometheus</title>
+    <link rel="stylesheet" href="./styles.css?v=7">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <strong>LungPrometheus</strong>
+        <span>Python MVP</span>
+      </div>
+      <div id="sessionPanel" class="session-panel hidden">
+        <span id="authUser" class="user-badge">admin</span>
+        <span id="balanceLabel" class="balance-badge">0 ₽</span>
+        <span id="requestPriceLabel" class="muted">Запрос: 80 ₽</span>
+        <form id="topUpForm" class="top-up-form">
+          <input id="topUpAmount" type="number" min="0.01" step="0.01" placeholder="Сумма">
+          <button class="primary compact" type="submit">Пополнить</button>
+        </form>
+        <button id="refreshButton" class="compact" type="button">Обновить</button>
+        <button id="logoutButton" class="compact" type="button">Выйти</button>
+      </div>
+    </header>
+
+    <section id="authPanel" class="auth-panel">
+      <div class="auth-box">
+        <div class="auth-tabs">
+          <button id="showLoginButton" class="active" type="button">Вход</button>
+          <button id="showRegisterButton" type="button">Регистрация</button>
+        </div>
+
+        <form id="loginForm" class="auth-form">
+          <label>
+            Логин
+            <input id="loginUsername" required autocomplete="username" value="admin">
+          </label>
+          <label>
+            Пароль
+            <input id="loginPassword" required type="password" autocomplete="current-password" value="admin">
+          </label>
+          <button class="primary" type="submit">Войти</button>
+        </form>
+
+        <form id="registerForm" class="auth-form hidden">
+          <label>
+            Логин
+            <input id="registerUsername" required autocomplete="username">
+          </label>
+          <label>
+            Пароль
+            <input id="registerPassword" required type="password" autocomplete="new-password">
+          </label>
+          <button class="primary" type="submit">Зарегистрироваться</button>
+        </form>
+
+        <p id="authMessage" class="auth-message"></p>
+      </div>
+    </section>
+
+    <main id="appLayout" class="layout hidden">
+      <section class="panel history-panel">
+        <div class="section-title">
+          <h1>История запросов</h1>
+          <span id="studyCount">0</span>
+        </div>
+        <div id="studyList" class="study-list"></div>
+      </section>
+
+      <section class="workspace">
+        <div id="emptyState" class="empty-state">
+          <h2>Выберите исследование</h2>
+        </div>
+
+        <article id="viewerPanel" class="viewer-panel hidden">
+          <div class="viewer-head">
+            <div>
+              <h2 id="viewerTitle">Просмотр исследования</h2>
+              <p id="studyInfo" class="muted">Файл не загружен</p>
+            </div>
+            <div class="viewer-actions">
+              <button id="reportButton" class="primary hidden" type="button">Создать заключение</button>
+            </div>
+          </div>
+
+          <div id="viewer" class="viewer">
+            <canvas id="imageCanvas"></canvas>
+            <canvas id="overlayCanvas"></canvas>
+            <div id="modelStatus" class="model-status">Модель ожидает файл</div>
+          </div>
+
+          <div class="viewer-controls">
+            <button id="prevButton" type="button">Назад</button>
+            <input id="sliceSlider" type="range" min="0" max="0" value="0">
+            <button id="nextButton" type="button">Вперёд</button>
+            <span id="sliceLabel">Срез 0 из 0</span>
+          </div>
+
+          <div class="zoom-controls">
+            <button id="zoomOutButton" type="button">−</button>
+            <input id="zoomSlider" type="range" min="80" max="300" step="10" value="100">
+            <button id="zoomInButton" type="button">+</button>
+            <span id="zoomLabel">100%</span>
+          </div>
+
+          <section>
+            <div class="section-title">
+              <h3>Находки модели</h3>
+              <span id="findingCount">0</span>
+            </div>
+            <div id="findingsList" class="findings-list">
+              <p>Пока нет анализа.</p>
+            </div>
+          </section>
+
+          <section id="reportPanel" class="report-panel hidden">
+            <h3>Заключение</h3>
+            <textarea id="reportText" readonly></textarea>
+          </section>
+        </article>
+      </section>
+
+      <aside class="panel upload-panel">
+        <h1>Добавить файл</h1>
+        <form id="patientForm" class="form">
+          <label>
+            ФИО
+            <input id="patientName" required placeholder="Иван Петров">
+          </label>
+          <label>
+            Дата рождения
+            <input id="birthDate" type="date" required>
+          </label>
+        </form>
+
+        <div class="upload-actions">
+          <label class="upload-button">
+            <input id="fileInput" type="file" multiple accept=".mhd,.raw,.dcm,.dicom,image/*">
+            Загрузить файл
+          </label>
+          <label class="upload-button secondary">
+            <input id="folderInput" type="file" multiple webkitdirectory>
+            Загрузить папку
+          </label>
+        </div>
+      </aside>
+    </main>
+
+    <script src="./app.js?v=7"></script>
+  </body>
+</html>

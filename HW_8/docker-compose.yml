@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      MODEL_WORKERS: 2
+      DB_PATH: /app/data/app.sqlite3
+      REPORT_SERVICE_URL: http://report-api:8766/api/reports/generate
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      - report-api
+
+  report-api:
+    build: .
+    command: uvicorn backend.report_service:app --host 0.0.0.0 --port 8766
+    ports:
+      - "8766:8766"
+    environment:
+      OLLAMA_URL: http://host.docker.internal:11434/api/generate
+      OLLAMA_MODEL: llama3.1
+
+volumes:
+  app-data:

@@ -1,0 +1,9 @@
+.build
+dist
+.git
+data
+__pycache__
+*.pyc
+*.sqlite3
+.DS_Store
+backend/weights

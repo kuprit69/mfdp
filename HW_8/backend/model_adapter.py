@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import base64
+import hashlib
+import math
+import os
+from pathlib import Path
+import random
+import uuid
+
+import numpy as np
+
+
+@dataclass
+class ModelConfig:
+    weights_path: str | None = None
+    patch_size: int = 32
+    batch_size: int = 32
+    threshold: float = 0.55
+    max_candidates: int = 384
+    max_detections: int = 8
+
+
+class NoduleModel:
+    """Python-side model adapter for LungPrometheus.
+
+    If `backend/weights/best_better3dcnn.pth` exists, the adapter runs the real
+    3D CNN. Without weights it falls back to deterministic mock detections so
+    the UI remains usable.
+    """
+
+    def __init__(self, config: ModelConfig | None = None) -> None:
+        self.config = config or ModelConfig(weights_path=self.default_weights_path())
+        self.weights_loaded = False
+        self._model = None
+        self._device = None
+
+    def load_weights(self, weights_path: str) -> None:
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Weights file not found: {weights_path}")
+        self.config.weights_path = weights_path
+        self.weights_loaded = False
+        self._model = None
+
+    def analyze(self, payload: dict) -> list[dict]:
+        if self.config.weights_path and os.path.exists(self.config.weights_path):
+            return self._analyze_with_real_model(payload)
+        return self._mock_analyze(payload)
+
+    def _analyze_with_real_model(self, payload: dict) -> list[dict]:
+        self._ensure_model_loaded()
+        volume, meta = self._payload_to_volume(payload)
+        if volume.size == 0:
+            return []
+
+        candidates = self._generate_candidates(volume)
+        if not candidates:
+            candidates = self._fallback_candidates(volume)
+
+        predictions = self._score_candidates(volume, candidates)
+        detections = [
+            item for item in predictions
+            if item["probability"] >= self.config.threshold
+        ]
+
+        return self._to_annotations(detections, meta)
+
+    def _ensure_model_loaded(self) -> None:
+        if self._model is not None:
+            return
+
+        import torch
+
+        model = build_better_3dcnn()
+        state_dict = torch.load(self.config.weights_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+
+        if torch.backends.mps.is_available():
+            self._device = torch.device("mps")
+        else:
+            self._device = torch.device("cpu")
+
+        model.to(self._device)
+        model.eval()
+        self._model = model
+        self.weights_loaded = True
+
+    def _payload_to_volume(self, payload: dict) -> tuple[np.ndarray, dict]:
+        series = payload.get("series") or []
+        slices: list[np.ndarray] = []
+
+        for item in series:
+            encoded = item.get("pixelData") or {}
+            data = encoded.get("data")
+            if not data:
+                continue
+
+            dtype = np.int16 if encoded.get("dtype") == "Int16Array" else np.uint16
+            rows = int(item.get("rows") or 0)
+            columns = int(item.get("columns") or 0)
+            raw = base64.b64decode(data.encode("ascii"))
+            pixels = np.frombuffer(raw, dtype=dtype)
+            if rows <= 0 or columns <= 0 or pixels.size < rows * columns:
+                continue
+
+            pixels = pixels[: rows * columns].reshape(rows, columns).astype(np.float32)
+            slope = float(item.get("rescaleSlope") or 1.0)
+            intercept = float(item.get("rescaleIntercept") or 0.0)
+            slices.append(pixels * slope + intercept)
+
+        if not slices:
+            return np.empty((0, 0, 0), dtype=np.float32), {}
+
+        first = series[0]
+        volume = np.stack(slices).astype(np.float32)
+        meta = {
+            "rows": int(first.get("rows") or volume.shape[1]),
+            "columns": int(first.get("columns") or volume.shape[2]),
+            "pixelSpacing": first.get("pixelSpacing") or [0.7, 0.7],
+            "sliceThickness": float(first.get("sliceThickness") or 1.0),
+        }
+        return volume, meta
+
+    def _generate_candidates(self, volume: np.ndarray) -> list[dict]:
+        z_count, rows, columns = volume.shape
+        half = self.config.patch_size // 2
+        z_step = max(2, min(10, z_count // 8 or 2))
+        xy_step = 28 if min(rows, columns) >= 256 else 16
+        candidates: list[dict] = []
+
+        if z_count < self.config.patch_size:
+            z_values = range(0, z_count, z_step)
+        else:
+            z_values = range(half, z_count - half + 1, z_step)
+        y_values = range(half, max(half + 1, rows - half), xy_step)
+        x_values = range(half, max(half + 1, columns - half), xy_step)
+
+        for z in z_values:
+            for y in y_values:
+                for x in x_values:
+                    context = volume[
+                        max(0, z - 1): min(z_count, z + 2),
+                        max(0, y - 24): min(rows, y + 24),
+                        max(0, x - 24): min(columns, x + 24),
+                    ]
+                    if context.size == 0:
+                        continue
+
+                    lung_fraction = float(np.mean(context < -300))
+                    soft_fraction = float(np.mean((context > -500) & (context < 250)))
+                    if lung_fraction < 0.08 or soft_fraction < 0.015:
+                        continue
+
+                    candidates.append(
+                        {
+                            "center": (int(z), int(y), int(x)),
+                            "score": soft_fraction + lung_fraction * 0.15,
+                        }
+                    )
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return candidates[: self.config.max_candidates]
+
+    def _fallback_candidates(self, volume: np.ndarray) -> list[dict]:
+        z_count, rows, columns = volume.shape
+        z_values = np.linspace(0, max(0, z_count - 1), num=min(8, max(1, z_count)), dtype=int)
+        y_values = np.linspace(rows * 0.25, rows * 0.75, num=5, dtype=int)
+        x_values = np.linspace(columns * 0.25, columns * 0.75, num=5, dtype=int)
+        return [
+            {"center": (int(z), int(y), int(x)), "score": 0.0}
+            for z in z_values
+            for y in y_values
+            for x in x_values
+        ][: self.config.max_candidates]
+
+    def _score_candidates(self, volume: np.ndarray, candidates: list[dict]) -> list[dict]:
+        import torch
+
+        scored: list[dict] = []
+        batch_patches: list[np.ndarray] = []
+        batch_candidates: list[dict] = []
+
+        for candidate in candidates:
+            patch = self._extract_patch(volume, candidate["center"], self.config.patch_size)
+            batch_patches.append(patch)
+            batch_candidates.append(candidate)
+            if len(batch_patches) >= self.config.batch_size:
+                scored.extend(self._score_batch(batch_patches, batch_candidates, torch))
+                batch_patches = []
+                batch_candidates = []
+
+        if batch_patches:
+            scored.extend(self._score_batch(batch_patches, batch_candidates, torch))
+
+        scored.sort(key=lambda item: item["probability"], reverse=True)
+        return self._nms_3d(scored)
+
+    def _score_batch(self, patches: list[np.ndarray], candidates: list[dict], torch_module) -> list[dict]:
+        tensor = torch_module.from_numpy(np.stack(patches)[:, None, :, :, :]).float().to(self._device)
+        with torch_module.no_grad():
+            logits = self._model(tensor)
+            probabilities = torch_module.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+
+        scored = []
+        for candidate, probability in zip(candidates, probabilities, strict=True):
+            scored.append(
+                {
+                    "center": candidate["center"],
+                    "probability": float(probability),
+                }
+            )
+        return scored
+
+    @staticmethod
+    def _extract_patch(volume: np.ndarray, center: tuple[int, int, int], size: int) -> np.ndarray:
+        z, y, x = center
+        half = size // 2
+        patch = np.zeros((size, size, size), dtype=np.float32)
+
+        src_z0, src_z1 = max(0, z - half), min(volume.shape[0], z + half)
+        src_y0, src_y1 = max(0, y - half), min(volume.shape[1], y + half)
+        src_x0, src_x1 = max(0, x - half), min(volume.shape[2], x + half)
+
+        dst_z0 = src_z0 - (z - half)
+        dst_y0 = src_y0 - (y - half)
+        dst_x0 = src_x0 - (x - half)
+
+        patch[
+            dst_z0: dst_z0 + (src_z1 - src_z0),
+            dst_y0: dst_y0 + (src_y1 - src_y0),
+            dst_x0: dst_x0 + (src_x1 - src_x0),
+        ] = volume[src_z0:src_z1, src_y0:src_y1, src_x0:src_x1]
+        return patch
+
+    def _nms_3d(self, scored: list[dict]) -> list[dict]:
+        kept: list[dict] = []
+        min_distance_voxels = self.config.patch_size * 0.75
+
+        for item in scored:
+            z, y, x = item["center"]
+            too_close = False
+            for kept_item in kept:
+                kz, ky, kx = kept_item["center"]
+                distance = math.sqrt((z - kz) ** 2 + (y - ky) ** 2 + (x - kx) ** 2)
+                if distance < min_distance_voxels:
+                    too_close = True
+                    break
+            if not too_close:
+                kept.append(item)
+            if len(kept) >= self.config.max_detections:
+                break
+        return kept
+
+    def _to_annotations(self, detections: list[dict], meta: dict) -> list[dict]:
+        row_spacing, col_spacing = self._pixel_spacing(meta)
+        annotations = []
+
+        for detection in detections:
+            z, y, x = detection["center"]
+            probability = detection["probability"]
+            diameter_mm = max(4.0, min(24.0, 6.0 + probability * 16.0))
+            width = max(6.0, diameter_mm / col_spacing)
+            height = max(6.0, diameter_mm / row_spacing)
+            rect = self._clamp_rect(
+                x - width / 2,
+                y - height / 2,
+                width,
+                height,
+                int(meta["rows"]),
+                int(meta["columns"]),
+            )
+
+            annotations.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "source": "auto",
+                    "confidence": round(probability, 2),
+                    "sliceIndex": int(z),
+                    "x": rect["x"],
+                    "y": rect["y"],
+                    "width": rect["width"],
+                    "height": rect["height"],
+                    "diameterMm": round(diameter_mm, 1),
+                    "segment": self._estimate_segment(rect, int(meta["rows"]), int(meta["columns"])),
+                }
+            )
+
+        return annotations
+
+    def _mock_analyze(self, payload: dict) -> list[dict]:
+        series = payload.get("series") or []
+        if not series:
+            return []
+
+        first = series[0]
+        seed_text = "|".join(
+            str(first.get(key, ""))
+            for key in ("studyInstanceUid", "seriesInstanceUid", "patientId", "patientName")
+        )
+        seed_text += f"|{len(series)}"
+        seed = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+        rng = random.Random(seed)
+
+        count = max(1, min(4, round(1 + rng.random() * 3)))
+        annotations: list[dict] = []
+        used_slices: set[int] = set()
+
+        for _ in range(count):
+            slice_index = self._pick_slice(len(series), rng, used_slices)
+            image = series[slice_index]
+            rows = int(image.get("rows") or 512)
+            columns = int(image.get("columns") or 512)
+            row_spacing, col_spacing = self._pixel_spacing(image)
+            diameter_mm = 5 + rng.random() * 17
+            width = max(8, diameter_mm / col_spacing)
+            height = max(8, diameter_mm / row_spacing)
+            x = columns * (0.22 + rng.random() * 0.56) - width / 2
+            y = rows * (0.20 + rng.random() * 0.58) - height / 2
+            rect = self._clamp_rect(x, y, width, height, rows, columns)
+            segment = self._estimate_segment(rect, rows, columns)
+
+            annotations.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "source": "auto",
+                    "confidence": round(0.72 + rng.random() * 0.23, 2),
+                    "sliceIndex": slice_index,
+                    "x": rect["x"],
+                    "y": rect["y"],
+                    "width": rect["width"],
+                    "height": rect["height"],
+                    "diameterMm": round(diameter_mm, 1),
+                    "segment": segment,
+                }
+            )
+
+        return sorted(annotations, key=lambda item: item["sliceIndex"])
+
+    @staticmethod
+    def _pick_slice(length: int, rng: random.Random, used: set[int]) -> int:
+        if length <= 1:
+            return 0
+        for _ in range(12):
+            index = min(length - 1, math.floor(length * (0.12 + rng.random() * 0.76)))
+            if index not in used:
+                used.add(index)
+                return index
+        return math.floor(rng.random() * length)
+
+    @staticmethod
+    def _pixel_spacing(image: dict) -> tuple[float, float]:
+        spacing = image.get("pixelSpacing") or [0.7, 0.7]
+        if not isinstance(spacing, list) or len(spacing) < 2:
+            return 0.7, 0.7
+        row = float(spacing[0] or 0.7)
+        col = float(spacing[1] or 0.7)
+        return row, col
+
+    @staticmethod
+    def default_weights_path() -> str | None:
+        candidate = Path(__file__).resolve().parent / "weights" / "best_better3dcnn.pth"
+        return str(candidate) if candidate.exists() else None
+
+    @staticmethod
+    def _clamp_rect(x: float, y: float, width: float, height: float, rows: int, columns: int) -> dict:
+        width = min(width, columns - 1)
+        height = min(height, rows - 1)
+        return {
+            "x": max(0, min(columns - width, x)),
+            "y": max(0, min(rows - height, y)),
+            "width": width,
+            "height": height,
+        }
+
+    @staticmethod
+    def _estimate_segment(rect: dict, rows: int, columns: int) -> dict:
+        center_x = rect["x"] + rect["width"] / 2
+        center_y = rect["y"] + rect["height"] / 2
+        side = "правого легкого" if center_x < columns / 2 else "левого легкого"
+        vertical = center_y / rows
+        segment = "S3"
+        lobe = "верхней доли"
+
+        if vertical > 0.66:
+            segment = "S10" if center_x < columns / 2 else "S9"
+            lobe = "нижней доли"
+        elif vertical > 0.42:
+            segment = "S5" if center_x < columns / 2 else "S6"
+            lobe = "средней доли" if center_x < columns / 2 else "нижней доли"
+        elif center_x > columns / 2:
+            segment = "S1+2"
+
+        return {
+            "short": f"{segment} {side}",
+            "label": f"{segment} {side}, {lobe}",
+        }
+
+
+def build_better_3dcnn():
+    import torch.nn as nn
+
+    class Better3DCNN(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv3d(1, 16, kernel_size=3, padding=1),
+                nn.BatchNorm3d(16),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+                nn.Conv3d(16, 32, kernel_size=3, padding=1),
+                nn.BatchNorm3d(32),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+                nn.Conv3d(32, 64, kernel_size=3, padding=1),
+                nn.BatchNorm3d(64),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+            )
+            self.fc = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(64 * 4 * 4 * 4, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 2),
+            )
+
+        def forward(self, x):
+            x = self.conv(x)
+            return self.fc(x)
+
+    return Better3DCNN()
