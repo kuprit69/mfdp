@@ -4,13 +4,45 @@ const AUTH_TOKEN_KEY = "lungPrometheusAuthToken";
 const state = {
   token: localStorage.getItem(AUTH_TOKEN_KEY) || "",
   user: null,
-  studies: [],
+  patients: [],
+  patientQuery: "",
+  patientPage: 0,
+  expandedPatientId: null,
+  patientStudiesCache: {},
   selectedStudyId: null,
   selectedStudy: null,
   slices: [],
   currentSlice: 0,
   detections: [],
-  zoom: 1
+  zoom: 1,
+  pan: { x: 0, y: 0 },
+  isPanning: false,
+  panStart: null,
+  panOrigin: null,
+  // null = use each slice's own window/level (from DICOM tags or auto pixel
+  // min/max); { center, width } = manual override applied to every slice.
+  windowOverride: null,
+  // A file has been parsed into slices but no study/patient exists for it
+  // yet - the "file first, then patient card" upload flow lives in these:
+  // pendingUpload holds the parsed slices, pendingMatch/pendingPatientInfo
+  // track the duplicate-detection step, and pendingTargetPatientId is set
+  // when the user chose "+ Добавить исследование" on an existing patient's
+  // card, so the very next dropped file skips the form/dedup step entirely.
+  pendingUpload: null,
+  pendingMatch: null,
+  pendingPatientInfo: null,
+  pendingTargetPatientId: null
+};
+
+const PATIENTS_PER_PAGE = 8;
+let patientSearchDebounceTimer = null;
+let defaultDropZoneHint = "";
+
+const WINDOW_PRESETS = {
+  // HU center/width presets, standard-ish radiology conventions.
+  lung: { center: -600, width: 1500 },
+  bone: { center: 400, width: 1800 },
+  soft: { center: 40, width: 400 }
 };
 
 const el = {};
@@ -21,15 +53,26 @@ document.addEventListener("DOMContentLoaded", () => {
     "requestPriceLabel", "topUpForm", "topUpAmount", "logoutButton",
     "showLoginButton", "showRegisterButton", "loginForm", "loginUsername",
     "loginPassword", "registerForm", "registerUsername", "registerPassword",
-    "authMessage", "refreshButton", "studyCount", "studyList", "emptyState", "viewerPanel",
+    "authMessage", "refreshButton", "patientCount", "patientList", "emptyState", "viewerPanel",
     "viewerTitle", "studyInfo", "reportButton", "viewer", "imageCanvas",
     "overlayCanvas", "modelStatus", "prevButton", "nextButton", "sliceSlider",
     "sliceLabel", "zoomOutButton", "zoomSlider", "zoomInButton", "zoomLabel",
-    "findingCount", "findingsList", "reportPanel", "reportText",
-    "patientForm", "patientName", "birthDate", "fileInput", "folderInput"
+    "findingCount", "findingsList", "reportPanel", "reportText", "reportSourceBadge",
+    "patientForm", "patientName", "birthDate", "fileInput", "folderInput", "toastContainer",
+    "dropZone", "dropZoneHint",
+    "patientSearch", "patientPagination", "patientPrevPageButton", "patientPageLabel", "patientNextPageButton",
+    "patientNameError", "birthDateError", "analysisProgress", "analysisProgressBar",
+    "wlLungButton", "wlBoneButton", "wlSoftButton", "wlAutoButton",
+    "wlCenterSlider", "wlWidthSlider", "wlCenterLabel", "wlWidthLabel", "resetViewButton",
+    "pendingUploadPanel", "pendingUploadSummary", "addStudyButton", "cancelPendingUploadButton",
+    "backToPendingUploadButton", "patientMatchPrompt", "patientMatchText",
+    "useExistingPatientButton", "createNewPatientButton",
+    "loadingOverlay", "loadingCanvas", "loadingCaptionText"
   ]) {
     el[id] = document.getElementById(id);
   }
+
+  defaultDropZoneHint = el.dropZoneHint ? el.dropZoneHint.textContent : "";
 
   el.showLoginButton.addEventListener("click", () => setAuthMode("login"));
   el.showRegisterButton.addEventListener("click", () => setAuthMode("register"));
@@ -37,17 +80,47 @@ document.addEventListener("DOMContentLoaded", () => {
   el.registerForm.addEventListener("submit", handleRegister);
   el.topUpForm.addEventListener("submit", handleTopUp);
   el.logoutButton.addEventListener("click", logout);
-  el.refreshButton.addEventListener("click", loadStudies);
+  el.refreshButton.addEventListener("click", () => loadPatients());
   el.fileInput.addEventListener("change", event => loadFiles(event.target.files));
   el.folderInput.addEventListener("change", event => loadFiles(event.target.files));
+  el.patientSearch.addEventListener("input", () => {
+    clearTimeout(patientSearchDebounceTimer);
+    const query = el.patientSearch.value.trim();
+    patientSearchDebounceTimer = setTimeout(() => loadPatients(query), 200);
+  });
+  el.patientPrevPageButton.addEventListener("click", () => {
+    state.patientPage = Math.max(0, state.patientPage - 1);
+    renderPatientList();
+  });
+  el.patientNextPageButton.addEventListener("click", () => {
+    state.patientPage += 1;
+    renderPatientList();
+  });
+  setupDropZone();
+  el.patientName.addEventListener("input", () => setFieldError(el.patientName, el.patientNameError, ""));
+  el.birthDate.addEventListener("input", () => setFieldError(el.birthDate, el.birthDateError, ""));
+  el.patientForm.addEventListener("submit", handlePatientFormSubmit);
+  el.addStudyButton.addEventListener("click", showPatientCardForm);
+  el.cancelPendingUploadButton.addEventListener("click", cancelPendingUpload);
+  el.backToPendingUploadButton.addEventListener("click", showPendingUploadCta);
+  el.useExistingPatientButton.addEventListener("click", handleUseExistingPatient);
+  el.createNewPatientButton.addEventListener("click", handleCreateNewPatient);
   el.prevButton.addEventListener("click", () => setSlice(state.currentSlice - 1));
   el.nextButton.addEventListener("click", () => setSlice(state.currentSlice + 1));
   el.sliceSlider.addEventListener("input", event => setSlice(Number(event.target.value)));
   el.zoomSlider.addEventListener("input", event => setZoom(Number(event.target.value) / 100));
   el.zoomOutButton.addEventListener("click", () => adjustZoom(-0.1));
   el.zoomInButton.addEventListener("click", () => adjustZoom(0.1));
+  el.resetViewButton.addEventListener("click", resetView);
   el.reportButton.addEventListener("click", generateReport);
   el.viewer.addEventListener("wheel", handleWheel, { passive: false });
+  el.viewer.addEventListener("pointerdown", startPan);
+  el.wlLungButton.addEventListener("click", () => applyWindowPreset("lung"));
+  el.wlBoneButton.addEventListener("click", () => applyWindowPreset("bone"));
+  el.wlSoftButton.addEventListener("click", () => applyWindowPreset("soft"));
+  el.wlAutoButton.addEventListener("click", () => applyWindowPreset("auto"));
+  el.wlCenterSlider.addEventListener("input", handleWindowSliderInput);
+  el.wlWidthSlider.addEventListener("input", handleWindowSliderInput);
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener("resize", render);
   initializeAuth();
@@ -63,7 +136,7 @@ async function initializeAuth() {
     const result = await api("/api/auth/me");
     setUser(result.user);
     showApp();
-    await loadStudies();
+    await loadPatients();
   } catch (error) {
     clearAuth();
     showAuth();
@@ -94,10 +167,37 @@ async function authenticate(path, body) {
     localStorage.setItem(AUTH_TOKEN_KEY, state.token);
     setUser(result.user);
     showApp();
-    await loadStudies();
+    await loadPatients();
   } catch (error) {
     setAuthMessage(error.message);
   }
+}
+
+function showToast(message, type = "error", duration = 5000) {
+  if (!el.toastContainer) {
+    // Toast container missing for some reason (older cached page) - don't
+    // silently swallow the message.
+    console.error(message);
+    return;
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  el.toastContainer.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("visible"));
+
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    toast.classList.remove("visible");
+    setTimeout(() => toast.remove(), 200);
+  };
+  const timer = setTimeout(dismiss, duration);
+  toast.addEventListener("click", () => {
+    clearTimeout(timer);
+    dismiss();
+  });
 }
 
 async function handleTopUp(event) {
@@ -112,7 +212,7 @@ async function handleTopUp(event) {
     setUser(result.user);
     el.topUpAmount.value = "";
   } catch (error) {
-    alert(error.message);
+    showToast(error.message);
   }
 }
 
@@ -149,12 +249,26 @@ function clearAuth() {
   state.user = null;
   localStorage.removeItem(AUTH_TOKEN_KEY);
   resetViewer();
-  state.studies = [];
+  cancelPendingUpload();
+  state.patients = [];
+  state.patientQuery = "";
+  state.expandedPatientId = null;
+  state.patientStudiesCache = {};
   state.selectedStudyId = null;
   state.selectedStudy = null;
 }
 
-function logout() {
+async function logout() {
+  // Invalidate the token server-side first (rotates it so it can't be reused
+  // if it leaked) - best-effort, since the user should still be able to log
+  // out locally even if the request fails (offline, server restarting, etc).
+  try {
+    if (state.token) {
+      await api("/api/auth/logout", { method: "POST" });
+    }
+  } catch (error) {
+    console.warn("Не удалось уведомить сервер о выходе:", error.message);
+  }
   clearAuth();
   showAuth();
 }
@@ -163,63 +277,235 @@ function setAuthMessage(message) {
   el.authMessage.textContent = message;
 }
 
-async function loadStudies() {
+async function loadPatients(query) {
   if (!state.user) return;
-  const result = await api("/api/studies");
-  state.studies = result.studies;
-  el.studyCount.textContent = state.studies.length;
+  if (typeof query === "string") state.patientQuery = query;
+  const result = await api(`/api/patients?query=${encodeURIComponent(state.patientQuery || "")}`);
+  state.patients = result.patients;
+  state.patientPage = 0;
+  renderPatientList();
+}
 
-  if (!state.studies.length) {
-    el.studyList.innerHTML = '<div class="empty-line">Пока пусто</div>';
-    resetViewer();
+async function loadPatientStudies(patientId) {
+  try {
+    const result = await api(`/api/patients/${patientId}`);
+    state.patientStudiesCache[patientId] = { studies: result.patient.studies };
+  } catch (error) {
+    state.patientStudiesCache[patientId] = { studies: [] };
+  }
+}
+
+async function togglePatientExpand(patientId) {
+  if (state.expandedPatientId === patientId) {
+    state.expandedPatientId = null;
+    renderPatientList();
+    return;
+  }
+  state.expandedPatientId = patientId;
+  renderPatientList();
+  if (!state.patientStudiesCache[patientId]) {
+    await loadPatientStudies(patientId);
+    renderPatientList();
+  }
+}
+
+function armAddStudyForPatient(patientId, patientName) {
+  state.pendingTargetPatientId = patientId;
+  if (el.dropZoneHint) {
+    el.dropZoneHint.textContent = `Перетащите файл — он будет добавлен пациенту «${patientName}»`;
+  }
+  showToast(`Загрузите файл — он будет добавлен в карту пациента «${patientName}»`, "success", 4500);
+}
+
+function renderPatientList() {
+  el.patientCount.textContent = state.patients.length;
+
+  if (!state.patients.length) {
+    el.patientList.innerHTML = `<div class="empty-line">${state.patientQuery ? "Ничего не найдено" : "Пока пусто"}</div>`;
+    el.patientPagination.classList.add("hidden");
+    if (!state.patientQuery) resetViewer();
     return;
   }
 
-  el.studyList.innerHTML = state.studies.map(study => `
-    <div class="study-row">
-      <button class="study-item ${study.id === state.selectedStudyId ? "active" : ""}" data-id="${study.id}" type="button">
-        <strong>${escapeHtml(study.patient_name)}</strong>
-        <span>${formatBirthDate(study.birth_date)} · ${study.finding_count} находок</span>
-        <small>${escapeHtml(study.status)}</small>
-      </button>
-      <button class="delete-study" data-delete-id="${study.id}" type="button" title="Удалить" aria-label="Удалить запрос ${escapeHtml(study.patient_name)}">🗑</button>
-    </div>
-  `).join("");
+  const pageCount = Math.max(1, Math.ceil(state.patients.length / PATIENTS_PER_PAGE));
+  state.patientPage = Math.max(0, Math.min(state.patientPage, pageCount - 1));
+  const start = state.patientPage * PATIENTS_PER_PAGE;
+  const pageItems = state.patients.slice(start, start + PATIENTS_PER_PAGE);
 
-  for (const button of el.studyList.querySelectorAll("[data-id]")) {
-    button.addEventListener("click", () => selectStudy(button.dataset.id));
+  el.patientList.innerHTML = pageItems.map(renderPatientCard).join("");
+
+  for (const button of el.patientList.querySelectorAll("[data-patient-toggle]")) {
+    button.addEventListener("click", () => togglePatientExpand(button.dataset.patientToggle));
   }
-  for (const button of el.studyList.querySelectorAll("[data-delete-id]")) {
-    button.addEventListener("click", () => deleteStudy(button.dataset.deleteId));
+  for (const button of el.patientList.querySelectorAll("[data-add-to-patient]")) {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      armAddStudyForPatient(button.dataset.addToPatient, button.dataset.patientName);
+    });
   }
+  for (const button of el.patientList.querySelectorAll("[data-study-id]")) {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      selectStudy(button.dataset.studyId);
+    });
+  }
+  for (const button of el.patientList.querySelectorAll("[data-delete-id]")) {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      handleDeleteClick(button, button.dataset.deleteId);
+    });
+  }
+
+  el.patientPagination.classList.toggle("hidden", pageCount <= 1);
+  el.patientPageLabel.textContent = `Стр. ${state.patientPage + 1} из ${pageCount}`;
+  el.patientPrevPageButton.disabled = state.patientPage <= 0;
+  el.patientNextPageButton.disabled = state.patientPage >= pageCount - 1;
+}
+
+function renderPatientCard(patient) {
+  const expanded = state.expandedPatientId === patient.id;
+  let studiesHtml = "";
+
+  if (expanded) {
+    const cache = state.patientStudiesCache[patient.id];
+    if (!cache) {
+      studiesHtml = '<p class="muted">Загрузка...</p>';
+    } else if (!cache.studies.length) {
+      studiesHtml = '<p class="muted">Исследований пока нет.</p>';
+    } else {
+      studiesHtml = cache.studies.map(study => `
+        <div class="study-row">
+          <button class="study-item ${study.id === state.selectedStudyId ? "active" : ""}" data-study-id="${study.id}" type="button">
+            <strong>${escapeHtml(study.description || "Исследование")}</strong>
+            <span>${formatDateTime(study.created_at)} · ${study.finding_count} находок</span>
+            <small>${escapeHtml(study.status)}</small>
+          </button>
+          <button class="delete-study" data-delete-id="${study.id}" type="button" title="Удалить" aria-label="Удалить исследование">🗑</button>
+        </div>
+      `).join("");
+    }
+  }
+
+  return `
+    <div class="patient-card">
+      <button class="patient-item ${expanded ? "active" : ""}" data-patient-toggle="${patient.id}" type="button">
+        <strong>${escapeHtml(patient.full_name)}</strong>
+        <span>${formatBirthDate(patient.birth_date)} · ${patient.study_count} исслед.</span>
+      </button>
+      ${expanded ? `
+        <div class="patient-studies">
+          ${studiesHtml}
+          <button class="add-study-to-patient compact" data-add-to-patient="${patient.id}" data-patient-name="${escapeHtml(patient.full_name)}" type="button">+ Добавить исследование</button>
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+async function refreshPatientsAndExpandedCard() {
+  if (state.expandedPatientId) {
+    delete state.patientStudiesCache[state.expandedPatientId];
+    await loadPatientStudies(state.expandedPatientId);
+  }
+  await loadPatients();
 }
 
 async function selectStudy(id) {
   state.selectedStudyId = id;
   const result = await api(`/api/studies/${id}`);
   state.selectedStudy = result.study;
-  state.slices = [];
-  state.detections = result.study.findings.map(finding => ({
-    title: finding.title,
-    confidence: finding.confidence,
-    sliceIndex: 0,
-    x: 0,
-    y: 0,
-    width: 0,
-    height: 0
-  }));
-  el.patientName.value = result.study.patient_name || "";
-  el.birthDate.value = result.study.birth_date || "";
-  renderStudyListSelection();
-  showHistoryDetails(result.study);
+  state.detections = result.study.findings
+    .filter(finding => finding.slice_index != null)
+    .map(finding => ({
+      title: finding.title,
+      confidence: finding.confidence,
+      sliceIndex: finding.slice_index,
+      x: finding.x || 0,
+      y: finding.y || 0,
+      width: finding.width || 0,
+      height: finding.height || 0
+    }));
+  if (result.study.patient_record_id && result.study.patient_record_id !== state.expandedPatientId) {
+    state.expandedPatientId = result.study.patient_record_id;
+    if (!state.patientStudiesCache[state.expandedPatientId]) {
+      await loadPatientStudies(state.expandedPatientId);
+    }
+  }
+  renderPatientList();
+
+  if (result.study.has_slices) {
+    await loadStoredSlices(result.study);
+  } else {
+    state.slices = [];
+    showHistoryDetails(result.study);
+  }
+}
+
+async function loadStoredSlices(study) {
+  clearOldUrls();
+  state.currentSlice = 0;
+  state.zoom = 1;
+  state.pan = { x: 0, y: 0 };
+  state.windowOverride = null;
+  el.modelStatus.textContent = "Загружаю сохранённый снимок...";
+
+  let slices = [];
+  try {
+    const result = await api(`/api/studies/${study.id}/slices`);
+    slices = (result.slices || []).map(decodeStoredSlice);
+  } catch (error) {
+    slices = [];
+  }
+
+  if (!slices.length) {
+    state.slices = [];
+    showHistoryDetails(study);
+    return;
+  }
+
+  state.slices = slices;
+  state.currentSlice = state.detections.length
+    ? state.detections[0].sliceIndex
+    : Math.floor((slices.length - 1) / 2);
+
+  el.emptyState.classList.add("hidden");
+  el.viewerPanel.classList.remove("hidden");
+  el.viewerTitle.textContent = study.patient_name;
+  el.studyInfo.textContent = `${slices.length} срез(ов) · ${formatBirthDate(study.birth_date)}`;
+  el.modelStatus.textContent = state.detections.length
+    ? `Находок: ${state.detections.length}`
+    : "Патологий не найдено";
+  el.reportButton.classList.toggle("hidden", !study.findings.length);
+  el.reportPanel.classList.toggle("hidden", !study.report);
+  el.reportText.value = study.report || "";
+  setReportSourceBadge(study.report_source);
+
+  hydrateControls();
+  render();
+  renderFindings();
+}
+
+function setReportSourceBadge(source) {
+  if (source === "ollama") {
+    el.reportSourceBadge.textContent = "сгенерировано ИИ (Ollama)";
+    el.reportSourceBadge.classList.remove("hidden", "fallback");
+    el.reportSourceBadge.classList.add("ollama");
+  } else if (source === "fallback") {
+    el.reportSourceBadge.textContent = "шаблон (ИИ недоступен)";
+    el.reportSourceBadge.classList.remove("hidden", "ollama");
+    el.reportSourceBadge.classList.add("fallback");
+  } else {
+    el.reportSourceBadge.classList.add("hidden");
+    el.reportSourceBadge.textContent = "";
+  }
 }
 
 function showHistoryDetails(study) {
   el.emptyState.classList.add("hidden");
   el.viewerPanel.classList.remove("hidden");
   el.viewerTitle.textContent = study.patient_name;
-  el.studyInfo.textContent = `Дата рождения: ${formatBirthDate(study.birth_date)}. Файл из истории не хранится в браузере.`;
-  el.modelStatus.textContent = "Для просмотра снимков загрузите файл справа.";
+  el.studyInfo.textContent = `Дата рождения: ${formatBirthDate(study.birth_date)}. Снимок для этого исследования не сохранён — загрузите файл заново, чтобы посмотреть его.`;
+  el.modelStatus.textContent = "Снимок недоступен.";
   el.reportButton.classList.toggle("hidden", !study.findings.length);
   el.findingCount.textContent = study.findings.length;
   el.findingsList.innerHTML = study.findings.length
@@ -238,33 +524,107 @@ function showHistoryDetails(study) {
   if (study.report) {
     el.reportPanel.classList.remove("hidden");
     el.reportText.value = study.report;
+    setReportSourceBadge(study.report_source);
   } else {
     el.reportPanel.classList.add("hidden");
     el.reportText.value = "";
   }
 }
 
-function renderStudyListSelection() {
-  for (const button of el.studyList.querySelectorAll("[data-id]")) {
-    button.classList.toggle("active", button.dataset.id === state.selectedStudyId);
+function decodeStoredSlice(raw) {
+  const TypedArrayCtor = TYPED_ARRAY_CTORS[(raw.pixelData || {}).dtype] || Int16Array;
+  const bytes = base64ToUint8Array(raw.pixelData.data);
+  const typed = new TypedArrayCtor(
+    bytes.buffer,
+    bytes.byteOffset,
+    Math.floor(bytes.byteLength / TypedArrayCtor.BYTES_PER_ELEMENT)
+  );
+  const slope = Number(raw.rescaleSlope || 1);
+  const intercept = Number(raw.rescaleIntercept || 0);
+  const scaled = new Float32Array(typed.length);
+  for (let i = 0; i < typed.length; i += 1) {
+    scaled[i] = typed[i] * slope + intercept;
   }
+  const { min, max } = minMax(scaled, scaled.length);
+
+  return {
+    format: "STORED",
+    name: raw.name,
+    width: raw.width || raw.columns,
+    height: raw.height || raw.rows,
+    pixelData: scaled,
+    pixelMin: min,
+    pixelMax: max,
+    windowCenter: min + (max - min) / 2,
+    windowWidth: Math.max(1, max - min),
+    spacing: raw.pixelSpacing
+  };
 }
 
-async function deleteStudy(id) {
-  const study = state.studies.find(item => item.id === id);
-  const name = study ? study.patient_name : "запрос";
-  if (!confirm(`Удалить из истории: ${name}?`)) return;
+const TYPED_ARRAY_CTORS = {
+  Int8Array,
+  Uint8Array,
+  Int16Array,
+  Uint16Array,
+  Int32Array,
+  Uint32Array,
+  Float32Array,
+  Float64Array
+};
 
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+const DELETE_CONFIRM_TIMEOUT_MS = 4000;
+
+function handleDeleteClick(button, id) {
+  if (button.dataset.confirming === "true") {
+    clearTimeout(Number(button.dataset.confirmTimer));
+    deleteStudy(id, button);
+    return;
+  }
+  // Only one row should be in the "are you sure" state at a time.
+  for (const other of el.patientList.querySelectorAll("[data-delete-id]")) {
+    if (other !== button) resetDeleteButton(other);
+  }
+  button.dataset.confirming = "true";
+  button.classList.add("confirming");
+  button.textContent = "Точно?";
+  button.title = "Нажмите ещё раз, чтобы удалить";
+  const timer = setTimeout(() => resetDeleteButton(button), DELETE_CONFIRM_TIMEOUT_MS);
+  button.dataset.confirmTimer = String(timer);
+}
+
+function resetDeleteButton(button) {
+  clearTimeout(Number(button.dataset.confirmTimer));
+  button.dataset.confirming = "false";
+  button.classList.remove("confirming");
+  button.textContent = "🗑";
+  button.title = "Удалить";
+}
+
+async function deleteStudy(id, button) {
   try {
+    if (button) button.disabled = true;
     await api(`/api/studies/${id}`, { method: "DELETE" });
     if (state.selectedStudyId === id) {
       state.selectedStudyId = null;
       state.selectedStudy = null;
       resetViewer();
     }
-    await loadStudies();
+    await refreshPatientsAndExpandedCard();
   } catch (error) {
-    alert(error.message);
+    showToast(error.message);
+    if (button) {
+      button.disabled = false;
+      resetDeleteButton(button);
+    }
   }
 }
 
@@ -274,14 +634,133 @@ function resetViewer() {
   state.currentSlice = 0;
   state.detections = [];
   state.zoom = 1;
+  state.pan = { x: 0, y: 0 };
+  state.windowOverride = null;
   el.emptyState.classList.remove("hidden");
   el.viewerPanel.classList.add("hidden");
   el.reportPanel.classList.add("hidden");
   el.reportText.value = "";
+  setReportSourceBadge("");
   if (el.imageCanvas && el.overlayCanvas) {
     el.imageCanvas.getContext("2d").clearRect(0, 0, el.imageCanvas.width, el.imageCanvas.height);
     el.overlayCanvas.getContext("2d").clearRect(0, 0, el.overlayCanvas.width, el.overlayCanvas.height);
   }
+}
+
+function setFieldError(inputEl, errorEl, message) {
+  inputEl.classList.toggle("invalid", Boolean(message));
+  if (errorEl) errorEl.textContent = message || "";
+}
+
+function setupDropZone() {
+  const zone = el.dropZone;
+  if (!zone) return;
+
+  // Without this, dropping a file anywhere the browser doesn't expect it
+  // navigates the tab to that file instead of doing nothing.
+  window.addEventListener("dragover", event => event.preventDefault());
+  window.addEventListener("drop", event => event.preventDefault());
+
+  ["dragenter", "dragover"].forEach(type => {
+    zone.addEventListener(type, event => {
+      event.preventDefault();
+      zone.classList.add("drag-active");
+    });
+  });
+  zone.addEventListener("dragleave", event => {
+    if (zone.contains(event.relatedTarget)) return;
+    zone.classList.remove("drag-active");
+  });
+  zone.addEventListener("drop", handleDrop);
+}
+
+async function handleDrop(event) {
+  event.preventDefault();
+  el.dropZone.classList.remove("drag-active");
+  if (!state.user) {
+    showToast("требуется вход");
+    return;
+  }
+
+  const items = event.dataTransfer?.items;
+  let files;
+  if (items && items.length && typeof items[0].webkitGetAsEntry === "function") {
+    files = await collectFilesFromDataTransferItems(items);
+  } else {
+    files = Array.from(event.dataTransfer?.files || []);
+  }
+  if (files.length) await loadFiles(files);
+}
+
+async function collectFilesFromDataTransferItems(items) {
+  const entries = Array.from(items)
+    .map(item => (typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  const files = [];
+  await Promise.all(entries.map(entry => walkFileSystemEntry(entry, "", files)));
+  return files;
+}
+
+function walkFileSystemEntry(entry, pathPrefix, files) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(file => {
+        // A dropped folder's files don't carry webkitRelativePath the way
+        // an <input webkitdirectory> selection does - set it manually so
+        // the .mhd/.raw companion-file lookup (which matches on relative
+        // path) works the same way regardless of how the files arrived.
+        const relativePath = `${pathPrefix}${entry.name}`;
+        if (relativePath !== file.name) {
+          try {
+            Object.defineProperty(file, "webkitRelativePath", { value: relativePath });
+          } catch (error) {
+            // Read-only in some browsers - matching falls back to file.name.
+          }
+        }
+        files.push(file);
+        resolve();
+      }, resolve);
+      return;
+    }
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readNextBatch = () => {
+        reader.readEntries(async batch => {
+          if (!batch.length) {
+            resolve();
+            return;
+          }
+          await Promise.all(batch.map(child => walkFileSystemEntry(child, `${pathPrefix}${entry.name}/`, files)));
+          readNextBatch();
+        }, resolve);
+      };
+      readNextBatch();
+      return;
+    }
+    resolve();
+  });
+}
+
+function validatePatientForm() {
+  const patientName = el.patientName.value.trim();
+  const birthDate = el.birthDate.value.trim();
+  let firstInvalid = null;
+
+  setFieldError(el.patientName, el.patientNameError, patientName ? "" : "Укажите ФИО пациента");
+  if (!patientName) firstInvalid = firstInvalid || el.patientName;
+
+  if (!birthDate) {
+    setFieldError(el.birthDate, el.birthDateError, "Укажите дату рождения");
+    firstInvalid = firstInvalid || el.birthDate;
+  } else if (new Date(birthDate) > new Date()) {
+    setFieldError(el.birthDate, el.birthDateError, "Дата рождения не может быть в будущем");
+    firstInvalid = firstInvalid || el.birthDate;
+  } else {
+    setFieldError(el.birthDate, el.birthDateError, "");
+  }
+
+  if (firstInvalid) firstInvalid.focus();
+  return { valid: !firstInvalid, patientName, birthDate };
 }
 
 async function loadFiles(fileList) {
@@ -292,30 +771,177 @@ async function loadFiles(fileList) {
     const files = Array.from(fileList || []);
     if (!files.length) return;
 
-    const patientName = el.patientName.value.trim();
-    const birthDate = el.birthDate.value.trim();
-    if (!patientName || !birthDate) {
-      alert("Заполните ФИО и дату рождения перед загрузкой файла.");
-      return;
-    }
-
     clearOldUrls();
-    state.slices = await filesToSlices(files);
-    if (!state.slices.length) {
+    const slices = await filesToSlices(files);
+    if (!slices.length) {
       throw new Error("Не найден поддерживаемый файл. Выберите .mhd + .raw, .dcm/.dicom или изображение.");
     }
 
-    const study = await createStudyForUpload(patientName, birthDate, files.length);
-    state.selectedStudyId = study.id;
-    state.selectedStudy = study;
-    state.currentSlice = Math.floor((state.slices.length - 1) / 2);
+    state.pendingUpload = { slices, filesCount: files.length, format: slices[0].format };
+
+    // Preview the file right away, before the patient card exists, so the
+    // person can confirm this is the right scan before filling anything in.
+    state.slices = slices;
+    state.selectedStudyId = null;
+    state.selectedStudy = null;
+    state.currentSlice = Math.floor((slices.length - 1) / 2);
     state.detections = [];
     state.zoom = 1;
+    state.pan = { x: 0, y: 0 };
+    state.windowOverride = null;
 
     el.emptyState.classList.add("hidden");
     el.viewerPanel.classList.remove("hidden");
-    el.viewerTitle.textContent = patientName;
-    el.studyInfo.textContent = `${state.slices.length} срез(ов) · ${state.slices[0].format} · ${formatBirthDate(birthDate)}`;
+    el.viewerTitle.textContent = "Новый файл";
+    el.studyInfo.textContent = `${slices.length} срез(ов) · ${slices[0].format} · пациент ещё не выбран`;
+    el.modelStatus.textContent = "Файл загружен.";
+    el.reportButton.classList.add("hidden");
+    el.reportPanel.classList.add("hidden");
+    el.reportText.value = "";
+    el.findingCount.textContent = "0";
+    el.findingsList.innerHTML = "<p>Пока нет анализа.</p>";
+
+    hydrateControls();
+    render();
+
+    if (state.pendingTargetPatientId) {
+      // "+ Добавить исследование" was clicked on a specific patient's card
+      // first - we already know who this file is for, skip the form/dedup
+      // step and attach it straight to that patient.
+      const targetPatientId = state.pendingTargetPatientId;
+      state.pendingTargetPatientId = null;
+      if (el.dropZoneHint) el.dropZoneHint.textContent = defaultDropZoneHint;
+      await finalizeUploadWithExistingPatient(targetPatientId);
+    } else {
+      showPendingUploadCta();
+    }
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    el.fileInput.value = "";
+    el.folderInput.value = "";
+  }
+}
+
+function showPendingUploadCta() {
+  el.pendingUploadPanel.classList.remove("hidden");
+  el.patientForm.classList.add("hidden");
+  el.patientMatchPrompt.classList.add("hidden");
+  const pending = state.pendingUpload;
+  el.pendingUploadSummary.textContent = pending
+    ? `Загружено: ${pending.slices.length} срез(ов), формат ${pending.format}`
+    : "";
+}
+
+function showPatientCardForm() {
+  if (!state.pendingUpload) return;
+  el.pendingUploadPanel.classList.add("hidden");
+  el.patientMatchPrompt.classList.add("hidden");
+  el.patientForm.classList.remove("hidden");
+  el.patientName.value = "";
+  el.birthDate.value = "";
+  setFieldError(el.patientName, el.patientNameError, "");
+  setFieldError(el.birthDate, el.birthDateError, "");
+  el.patientName.focus();
+}
+
+function resetUploadFlow() {
+  state.pendingUpload = null;
+  state.pendingMatch = null;
+  state.pendingPatientInfo = null;
+  state.pendingTargetPatientId = null;
+  if (el.dropZoneHint) el.dropZoneHint.textContent = defaultDropZoneHint;
+  el.pendingUploadPanel.classList.add("hidden");
+  el.patientForm.classList.add("hidden");
+  el.patientMatchPrompt.classList.add("hidden");
+  el.patientName.value = "";
+  el.birthDate.value = "";
+  setFieldError(el.patientName, el.patientNameError, "");
+  setFieldError(el.birthDate, el.birthDateError, "");
+}
+
+function cancelPendingUpload() {
+  resetUploadFlow();
+  resetViewer();
+}
+
+async function handlePatientFormSubmit(event) {
+  event.preventDefault();
+  if (!state.pendingUpload) {
+    showToast("Сначала загрузите файл");
+    return;
+  }
+  const { valid, patientName, birthDate } = validatePatientForm();
+  if (!valid) return;
+
+  state.pendingPatientInfo = { patientName, birthDate };
+  try {
+    const result = await api("/api/patients/match", {
+      method: "POST",
+      body: { full_name: patientName, birth_date: birthDate }
+    });
+    if (result.match) {
+      showPatientMatchPrompt(result.match);
+    } else {
+      await handleCreateNewPatient();
+    }
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function showPatientMatchPrompt(match) {
+  state.pendingMatch = match;
+  el.patientForm.classList.add("hidden");
+  el.patientMatchPrompt.classList.remove("hidden");
+  el.patientMatchText.textContent =
+    `Пациент «${match.full_name}» (${formatBirthDate(match.birth_date)}) уже есть в базе, ` +
+    `${match.study_count} исслед. Добавить это исследование в его карту или завести нового пациента?`;
+}
+
+async function handleUseExistingPatient() {
+  if (!state.pendingMatch) return;
+  await finalizeUploadWithExistingPatient(state.pendingMatch.id);
+}
+
+async function handleCreateNewPatient() {
+  const info = state.pendingPatientInfo;
+  if (!info) return;
+  try {
+    const result = await api("/api/patients", {
+      method: "POST",
+      body: { full_name: info.patientName, birth_date: info.birthDate }
+    });
+    await finalizeUploadWithExistingPatient(result.patient.id);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function finalizeUploadWithExistingPatient(patientId) {
+  const pending = state.pendingUpload;
+  if (!pending) return;
+  try {
+    const result = await api(`/api/patients/${patientId}/studies`, {
+      method: "POST",
+      body: { description: `Загружено файлов: ${pending.filesCount}` }
+    });
+    if (result.user) setUser(result.user);
+    const study = result.study;
+
+    state.slices = pending.slices;
+    state.selectedStudyId = study.id;
+    state.selectedStudy = study;
+    state.currentSlice = Math.floor((pending.slices.length - 1) / 2);
+    state.detections = [];
+    state.zoom = 1;
+    state.pan = { x: 0, y: 0 };
+    state.windowOverride = null;
+
+    el.emptyState.classList.add("hidden");
+    el.viewerPanel.classList.remove("hidden");
+    el.viewerTitle.textContent = study.patient_name;
+    el.studyInfo.textContent = `${pending.slices.length} срез(ов) · ${pending.format} · ${formatBirthDate(study.birth_date)}`;
     el.modelStatus.textContent = "Модель анализирует...";
     el.reportButton.classList.add("hidden");
     el.reportPanel.classList.add("hidden");
@@ -323,27 +949,14 @@ async function loadFiles(fileList) {
 
     hydrateControls();
     render();
-    await analyzeWithPython();
-    await loadStudies();
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    el.fileInput.value = "";
-    el.folderInput.value = "";
-  }
-}
 
-async function createStudyForUpload(patientName, birthDate, filesCount) {
-  const result = await api("/api/studies", {
-    method: "POST",
-    body: {
-      patient_name: patientName,
-      birth_date: birthDate,
-      description: `Загружено файлов: ${filesCount}`
-    }
-  });
-  if (result.user) setUser(result.user);
-  return result.study;
+    resetUploadFlow();
+    state.expandedPatientId = patientId;
+    await runAnalysisJob();
+    await refreshPatientsAndExpandedCard();
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 async function filesToSlices(files) {
@@ -642,50 +1255,187 @@ function parseDicom(buffer, filename) {
   };
 }
 
-async function analyzeWithPython() {
+async function runAnalysisJob() {
+  if (!state.selectedStudyId) return;
+  el.modelStatus.textContent = "Модель анализирует...";
+  showAnalysisProgress();
   try {
-    const result = await api("/api/viewer/analyze", {
+    const started = await api(`/api/studies/${state.selectedStudyId}/analyze`, {
       method: "POST",
-      body: {
-        slices: state.slices.map(slice => ({
-          name: slice.name,
-          width: slice.width,
-          height: slice.height
-        }))
-      }
+      body: { slices: state.slices.map(serializeSliceForModel) }
     });
-    state.detections = result.detections || [];
-    await saveDetectionsAsFindings();
+    const job = await pollJob(started.job.id, setAnalysisProgress);
+    if (job.status === "failed") {
+      throw new Error(job.error || "не удалось проанализировать снимок");
+    }
+
+    const findings = (job.result && job.result.findings) || [];
+    state.detections = findings.map(normalizeFinding);
+    const modelInfo = (job.result && job.result.model) || {};
     const first = state.detections[0];
     if (first) {
       state.currentSlice = first.sliceIndex;
-      el.modelStatus.textContent = `Найден объект: ${Math.round(first.confidence * 100)}%`;
-      el.reportButton.classList.remove("hidden");
+      el.modelStatus.textContent = `Вероятность ${Math.round(first.confidence * 100)}% · ${modelInfo.name || "модель"}`;
     } else {
-      el.modelStatus.textContent = "Патологий не найдено";
-      el.reportButton.classList.remove("hidden");
+      const probability = Number(modelInfo.probability || 0);
+      el.modelStatus.textContent = probability
+        ? `Вероятность ${Math.round(probability * 100)}%, ниже порога`
+        : "Патологий не найдено";
     }
+    el.reportButton.classList.remove("hidden");
     hydrateControls();
     render();
     renderFindings();
   } catch (error) {
     el.modelStatus.textContent = `Ошибка модели: ${error.message}`;
+    showToast(`Анализ не удался: ${error.message}`);
+  } finally {
+    hideAnalysisProgress();
   }
 }
 
-async function saveDetectionsAsFindings() {
-  if (!state.selectedStudyId) return;
-  for (const detection of state.detections) {
-    await api(`/api/studies/${state.selectedStudyId}/findings`, {
-      method: "POST",
-      body: {
-        title: detection.title,
-        diameter_mm: Math.max(1, (Number(detection.width) + Number(detection.height)) / 2),
-        confidence: detection.confidence,
-        source: "model"
-      }
-    });
+function showAnalysisProgress() {
+  el.analysisProgress.classList.remove("hidden");
+  setAnalysisProgress(0);
+  startLoadingAnimation();
+}
+
+function setAnalysisProgress(fraction) {
+  el.analysisProgressBar.style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`;
+}
+
+function hideAnalysisProgress() {
+  el.analysisProgress.classList.add("hidden");
+  setAnalysisProgress(0);
+  stopLoadingAnimation();
+}
+
+const LOADING_ANIMATION_FRAME_MS = 90;
+let loadingAnimationTimer = null;
+let loadingAnimationIndex = 0;
+
+function startLoadingAnimation(caption) {
+  if (!el.loadingOverlay || !el.loadingCanvas) return;
+  el.loadingCaptionText.textContent = caption || "Модель анализирует срезы";
+  el.loadingOverlay.classList.remove("hidden");
+  // Force layout before adding "visible" so the opacity transition actually
+  // plays instead of jumping straight to the end state.
+  void el.loadingOverlay.offsetWidth;
+  el.loadingOverlay.classList.add("visible");
+
+  loadingAnimationIndex = 0;
+  stepLoadingAnimation();
+  clearInterval(loadingAnimationTimer);
+  loadingAnimationTimer = setInterval(stepLoadingAnimation, LOADING_ANIMATION_FRAME_MS);
+}
+
+function stepLoadingAnimation() {
+  if (!el.loadingCanvas || !state.slices.length) return;
+  const slice = state.slices[loadingAnimationIndex % state.slices.length];
+  loadingAnimationIndex += 1;
+
+  const context = el.loadingCanvas.getContext("2d");
+  el.loadingCanvas.width = slice.width;
+  el.loadingCanvas.height = slice.height;
+  if (slice.image) {
+    context.clearRect(0, 0, slice.width, slice.height);
+    context.drawImage(slice.image, 0, 0);
+  } else {
+    renderPixelSlice(context, slice);
   }
+}
+
+function stopLoadingAnimation() {
+  clearInterval(loadingAnimationTimer);
+  loadingAnimationTimer = null;
+  if (!el.loadingOverlay) return;
+  el.loadingOverlay.classList.remove("visible");
+  setTimeout(() => {
+    if (!loadingAnimationTimer) el.loadingOverlay.classList.add("hidden");
+  }, 260);
+}
+
+async function pollJob(jobId, onProgress) {
+  const maxAttempts = 150;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const result = await api(`/api/jobs/${jobId}`);
+    const job = result.job;
+    if (job.status === "done" || job.status === "failed") {
+      if (onProgress) onProgress(1);
+      return job;
+    }
+    // The real remaining time is unknown, so the bar approaches - but never
+    // quite reaches - 100% while waiting, then jumps to 100% on completion.
+    if (onProgress) onProgress(Math.min(0.92, attempt / maxAttempts));
+    await sleep(400);
+  }
+  throw new Error("анализ занял слишком много времени");
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function serializeSliceForModel(slice) {
+  const serialized = {
+    name: slice.name,
+    width: slice.width,
+    height: slice.height,
+    rows: slice.height,
+    columns: slice.width,
+    format: slice.format,
+    pixelSpacing: slice.spacing || slice.pixelSpacing,
+    sliceThickness: slice.sliceThickness,
+    rescaleSlope: 1,
+    rescaleIntercept: 0
+  };
+
+  if (slice.pixelData) {
+    serialized.pixelData = encodePixelDataForModel(slice.pixelData);
+  }
+
+  return serialized;
+}
+
+function encodePixelDataForModel(pixelData) {
+  if (pixelData instanceof Float32Array || pixelData instanceof Float64Array) {
+    const quantized = new Int16Array(pixelData.length);
+    for (let i = 0; i < pixelData.length; i += 1) {
+      const value = Math.round(pixelData[i]);
+      quantized[i] = Math.max(-32768, Math.min(32767, value));
+    }
+    return { dtype: "Int16Array", data: arrayBufferToBase64(quantized.buffer) };
+  }
+
+  return {
+    dtype: pixelData.constructor?.name || "Int16Array",
+    data: arrayBufferToBase64(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength)
+  };
+}
+
+function arrayBufferToBase64(buffer, byteOffset = 0, byteLength = buffer.byteLength) {
+  const bytes = new Uint8Array(buffer, byteOffset, byteLength);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function normalizeFinding(finding) {
+  return {
+    id: finding.id,
+    title: finding.title || "Подозрительный объект",
+    confidence: Number(finding.confidence || 0),
+    diameterMm: finding.diameter_mm,
+    sliceIndex: Math.max(0, Math.min(state.slices.length - 1, Number(finding.slice_index ?? 0))),
+    x: Number(finding.x || 0),
+    y: Number(finding.y || 0),
+    width: Number(finding.width || 0),
+    height: Number(finding.height || 0)
+  };
 }
 
 async function generateReport() {
@@ -697,18 +1447,19 @@ async function generateReport() {
       method: "POST",
       body: {
         study_id: state.selectedStudyId,
-        patient_name: el.patientName.value.trim(),
-        birth_date: el.birthDate.value.trim(),
+        patient_name: (state.selectedStudy && state.selectedStudy.patient_name) || "",
+        birth_date: (state.selectedStudy && state.selectedStudy.birth_date) || "",
         slices_count: state.slices.length,
         detections: state.detections
       }
     });
     el.reportPanel.classList.remove("hidden");
     el.reportText.value = result.report;
+    setReportSourceBadge(result.source);
     if (result.study) state.selectedStudy = result.study;
-    await loadStudies();
+    await refreshPatientsAndExpandedCard();
   } catch (error) {
-    alert(`Не удалось создать заключение: ${error.message}`);
+    showToast(`Не удалось создать заключение: ${error.message}`);
   } finally {
     el.reportButton.disabled = false;
     el.reportButton.textContent = "Создать заключение";
@@ -726,6 +1477,53 @@ function hydrateControls() {
     : "Срез 0 из 0";
   el.zoomSlider.value = String(Math.round(state.zoom * 100));
   el.zoomLabel.textContent = `${Math.round(state.zoom * 100)}%`;
+  updateWindowControls();
+}
+
+function currentSliceWindow() {
+  const slice = state.slices[state.currentSlice];
+  if (state.windowOverride) return state.windowOverride;
+  if (!slice) return { center: 0, width: 1 };
+  return {
+    center: Number(slice.windowCenter ?? (slice.pixelMin + slice.pixelMax) / 2 ?? 0),
+    width: Math.max(1, Number(slice.windowWidth ?? (slice.pixelMax - slice.pixelMin) ?? 1))
+  };
+}
+
+function updateWindowControls() {
+  const slice = state.slices[state.currentSlice];
+  // Only slices with real HU pixel data (DICOM/MHD) can be windowed - a
+  // plain image (PNG/JPEG fallback) has no HU values to remap.
+  const hasPixelData = Boolean(slice && slice.pixelData && !slice.image);
+  for (const control of [el.wlLungButton, el.wlBoneButton, el.wlSoftButton, el.wlAutoButton, el.wlCenterSlider, el.wlWidthSlider]) {
+    control.disabled = !hasPixelData;
+  }
+  if (!hasPixelData) {
+    el.wlCenterLabel.textContent = "—";
+    el.wlWidthLabel.textContent = "—";
+    return;
+  }
+  const { center, width } = currentSliceWindow();
+  el.wlCenterSlider.value = String(Math.round(center));
+  el.wlWidthSlider.value = String(Math.round(width));
+  el.wlCenterLabel.textContent = `${Math.round(center)} HU`;
+  el.wlWidthLabel.textContent = `${Math.round(width)} HU`;
+}
+
+function applyWindowPreset(name) {
+  state.windowOverride = name === "auto" ? null : { ...WINDOW_PRESETS[name] };
+  updateWindowControls();
+  render();
+}
+
+function handleWindowSliderInput() {
+  state.windowOverride = {
+    center: Number(el.wlCenterSlider.value),
+    width: Math.max(1, Number(el.wlWidthSlider.value))
+  };
+  el.wlCenterLabel.textContent = `${state.windowOverride.center} HU`;
+  el.wlWidthLabel.textContent = `${state.windowOverride.width} HU`;
+  render();
 }
 
 function setSlice(index) {
@@ -771,8 +1569,9 @@ function render() {
 
 function renderPixelSlice(context, slice) {
   const imageData = context.createImageData(slice.width, slice.height);
-  const center = Number(slice.windowCenter ?? ((slice.pixelMin + slice.pixelMax) / 2));
-  const width = Math.max(1, Number(slice.windowWidth ?? (slice.pixelMax - slice.pixelMin)));
+  const override = state.windowOverride;
+  const center = Number(override?.center ?? slice.windowCenter ?? ((slice.pixelMin + slice.pixelMax) / 2));
+  const width = Math.max(1, Number(override?.width ?? slice.windowWidth ?? (slice.pixelMax - slice.pixelMin)));
   const low = center - width / 2;
 
   for (let i = 0; i < slice.pixelData.length; i += 1) {
@@ -794,10 +1593,59 @@ function fitCanvases(slice) {
   const width = Math.max(1, Math.floor(slice.width * scale));
   const height = Math.max(1, Math.floor(slice.height * scale));
 
+  state.pan = clampPan(state.pan, width, height, rect.width, rect.height);
+
   for (const canvas of [el.imageCanvas, el.overlayCanvas]) {
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
+    canvas.style.transform = `translate(${state.pan.x}px, ${state.pan.y}px)`;
   }
+}
+
+function clampPan(pan, contentWidth, contentHeight, viewportWidth, viewportHeight) {
+  // The image is centered in the viewer, so it can be dragged until its edge
+  // reaches the viewer's edge (plus a little slack) - no further.
+  const slack = 40;
+  const maxX = Math.max(0, (contentWidth - viewportWidth) / 2 + slack);
+  const maxY = Math.max(0, (contentHeight - viewportHeight) / 2 + slack);
+  return {
+    x: Math.max(-maxX, Math.min(maxX, pan.x)),
+    y: Math.max(-maxY, Math.min(maxY, pan.y))
+  };
+}
+
+function resetView() {
+  state.zoom = 1;
+  state.pan = { x: 0, y: 0 };
+  hydrateControls();
+  if (state.slices.length) fitCanvases(state.slices[state.currentSlice]);
+}
+
+function startPan(event) {
+  if (event.button !== 0 || !state.slices.length) return;
+  // Ignore drags that start on a control sitting on top of the viewer.
+  if (event.target.closest("button, input, .model-status, .analysis-progress")) return;
+  state.isPanning = true;
+  state.panStart = { x: event.clientX, y: event.clientY };
+  state.panOrigin = { ...state.pan };
+  el.viewer.classList.add("panning");
+  window.addEventListener("pointermove", handlePanMove);
+  window.addEventListener("pointerup", stopPan, { once: true });
+  event.preventDefault();
+}
+
+function handlePanMove(event) {
+  if (!state.isPanning) return;
+  const dx = event.clientX - state.panStart.x;
+  const dy = event.clientY - state.panStart.y;
+  state.pan = { x: state.panOrigin.x + dx, y: state.panOrigin.y + dy };
+  if (state.slices.length) fitCanvases(state.slices[state.currentSlice]);
+}
+
+function stopPan() {
+  state.isPanning = false;
+  el.viewer.classList.remove("panning");
+  window.removeEventListener("pointermove", handlePanMove);
 }
 
 function drawDetections() {
@@ -990,6 +1838,19 @@ function formatBirthDate(value) {
   const parts = String(value).split("-");
   if (parts.length === 3) return `${parts[2]}.${parts[1]}.${parts[0]}`;
   return value;
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 function formatRubles(value) {

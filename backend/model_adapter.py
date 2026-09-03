@@ -10,6 +10,7 @@ import random
 import uuid
 
 import numpy as np
+from scipy import ndimage
 
 
 @dataclass
@@ -17,7 +18,11 @@ class ModelConfig:
     weights_path: str | None = None
     patch_size: int = 32
     batch_size: int = 32
-    threshold: float = 0.55
+    # Scan-level detection threshold (env: MODEL_DETECTION_THRESHOLD). This is
+    # the ONLY threshold that actually gates which candidates become findings
+    # - see the note on `checkpoint_threshold` below for why it is set higher
+    # than the checkpoint's own patch-level threshold.
+    threshold: float = 0.85
     max_candidates: int = 384
     max_detections: int = 8
 
@@ -25,16 +30,28 @@ class ModelConfig:
 class NoduleModel:
     """Python-side model adapter for LungPrometheus.
 
-    If `backend/weights/best_better3dcnn.pth` exists, the adapter runs the real
-    3D CNN. Without weights it falls back to deterministic mock detections so
-    the UI remains usable.
+    If a configured checkpoint exists, the adapter runs the real 3D CNN and
+    returns model probabilities. Without weights it falls back to deterministic
+    mock detections so the UI remains usable.
     """
 
     def __init__(self, config: ModelConfig | None = None) -> None:
-        self.config = config or ModelConfig(weights_path=self.default_weights_path())
+        self.config = config or ModelConfig(
+            weights_path=self.default_weights_path(),
+            threshold=float(os.getenv("MODEL_DETECTION_THRESHOLD", "0.85")),
+        )
         self.weights_loaded = False
         self._model = None
         self._device = None
+        self.model_name = "mock"
+        self.last_probability: float | None = None
+        self.last_threshold = self.config.threshold
+        # Informational only (surfaced in API/report metadata as
+        # "checkpointThreshold") - the patch-level threshold the checkpoint's
+        # own training run picked (e.g. 0.45, tuned for per-patch F1/F2 on a
+        # single candidate). It is NEVER used to filter detections; see
+        # `_analyze_with_real_model` below for the threshold that is.
+        self.checkpoint_threshold: float | None = None
 
     def load_weights(self, weights_path: str) -> None:
         if not os.path.exists(weights_path):
@@ -52,13 +69,24 @@ class NoduleModel:
         self._ensure_model_loaded()
         volume, meta = self._payload_to_volume(payload)
         if volume.size == 0:
+            self.last_probability = 0.0
             return []
 
         candidates = self._generate_candidates(volume)
         if not candidates:
-            candidates = self._fallback_candidates(volume)
+            self.last_probability = 0.0
+            return []
 
         predictions = self._score_candidates(volume, candidates)
+        self.last_probability = max((item["probability"] for item in predictions), default=0.0)
+        # Deliberately uses `self.config.threshold` (scan-level, from
+        # MODEL_DETECTION_THRESHOLD), NOT `self.checkpoint_threshold`. A full
+        # scan generates dozens to hundreds of candidate patches per volume
+        # (see `_generate_candidates`), so a per-patch threshold tuned on a
+        # single-candidate validation set (candidates_V2.csv-style, one
+        # prediction per row) would let through far more false positives once
+        # applied hundreds of times per scan. The stricter scan-level value
+        # compensates for that multiple-testing effect.
         detections = [
             item for item in predictions
             if item["probability"] >= self.config.threshold
@@ -72,8 +100,19 @@ class NoduleModel:
 
         import torch
 
-        model = build_better_3dcnn()
-        state_dict = torch.load(self.config.weights_path, map_location="cpu")
+        checkpoint = torch.load(self.config.weights_path, map_location="cpu")
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        checkpoint_name = str(checkpoint.get("model_name", "")) if isinstance(checkpoint, dict) else ""
+        self.model_name = checkpoint_name or self._infer_model_name(state_dict)
+        if isinstance(checkpoint, dict):
+            # Read for display/metadata purposes only - does not overwrite
+            # `self.config.threshold`, which stays the scan-level value from
+            # MODEL_DETECTION_THRESHOLD regardless of what is in the checkpoint.
+            self.checkpoint_threshold = float(checkpoint.get("threshold") or self.config.threshold)
+            self.config.patch_size = int(checkpoint.get("patch_size") or self.config.patch_size)
+        self.last_threshold = self.config.threshold
+
+        model = build_improved_3dcnn() if self.model_name == "Improved3DCNN" else build_better_3dcnn()
         model.load_state_dict(state_dict)
 
         if torch.backends.mps.is_available():
@@ -87,7 +126,7 @@ class NoduleModel:
         self.weights_loaded = True
 
     def _payload_to_volume(self, payload: dict) -> tuple[np.ndarray, dict]:
-        series = payload.get("series") or []
+        series = payload.get("series") or payload.get("slices") or []
         slices: list[np.ndarray] = []
 
         for item in series:
@@ -96,17 +135,16 @@ class NoduleModel:
             if not data:
                 continue
 
-            dtype = np.int16 if encoded.get("dtype") == "Int16Array" else np.uint16
-            rows = int(item.get("rows") or 0)
-            columns = int(item.get("columns") or 0)
+            rows = int(item.get("rows") or item.get("height") or 0)
+            columns = int(item.get("columns") or item.get("width") or 0)
             raw = base64.b64decode(data.encode("ascii"))
-            pixels = np.frombuffer(raw, dtype=dtype)
+            pixels = np.frombuffer(raw, dtype=self._dtype_from_name(encoded.get("dtype")))
             if rows <= 0 or columns <= 0 or pixels.size < rows * columns:
                 continue
 
             pixels = pixels[: rows * columns].reshape(rows, columns).astype(np.float32)
-            slope = float(item.get("rescaleSlope") or 1.0)
-            intercept = float(item.get("rescaleIntercept") or 0.0)
+            slope = float(item.get("rescaleSlope") or encoded.get("slope") or 1.0)
+            intercept = float(item.get("rescaleIntercept") or encoded.get("intercept") or 0.0)
             slices.append(pixels * slope + intercept)
 
         if not slices:
@@ -115,52 +153,175 @@ class NoduleModel:
         first = series[0]
         volume = np.stack(slices).astype(np.float32)
         meta = {
-            "rows": int(first.get("rows") or volume.shape[1]),
-            "columns": int(first.get("columns") or volume.shape[2]),
+            "rows": int(first.get("rows") or first.get("height") or volume.shape[1]),
+            "columns": int(first.get("columns") or first.get("width") or volume.shape[2]),
             "pixelSpacing": first.get("pixelSpacing") or [0.7, 0.7],
             "sliceThickness": float(first.get("sliceThickness") or 1.0),
+            "modelName": self.model_name,
+            "threshold": self.config.threshold,
+            "checkpointThreshold": self.checkpoint_threshold,
         }
         return volume, meta
+
+    @staticmethod
+    def _dtype_from_name(name: str | None):
+        return {
+            "Int8Array": np.int8,
+            "Uint8Array": np.uint8,
+            "Int16Array": np.int16,
+            "Uint16Array": np.uint16,
+            "Int32Array": np.int32,
+            "Uint32Array": np.uint32,
+            "Float32Array": np.float32,
+            "Float64Array": np.float64,
+        }.get(str(name or ""), np.int16)
 
     def _generate_candidates(self, volume: np.ndarray) -> list[dict]:
         z_count, rows, columns = volume.shape
         half = self.config.patch_size // 2
-        z_step = max(2, min(10, z_count // 8 or 2))
-        xy_step = 28 if min(rows, columns) >= 256 else 16
+        z_step = max(1, min(4, z_count // 32 or 1))
+        xy_step = 16 if min(rows, columns) >= 256 else 8
+        lung_masks = self._build_lung_masks(volume)
+        slice_lung_fraction = np.mean(lung_masks, axis=(1, 2)) if lung_masks.size else np.array([])
         candidates: list[dict] = []
 
-        if z_count < self.config.patch_size:
-            z_values = range(0, z_count, z_step)
-        else:
-            z_values = range(half, z_count - half + 1, z_step)
+        z_values = range(0, z_count, z_step)
         y_values = range(half, max(half + 1, rows - half), xy_step)
         x_values = range(half, max(half + 1, columns - half), xy_step)
 
         for z in z_values:
-            for y in y_values:
-                for x in x_values:
-                    context = volume[
-                        max(0, z - 1): min(z_count, z + 2),
-                        max(0, y - 24): min(rows, y + 24),
-                        max(0, x - 24): min(columns, x + 24),
-                    ]
-                    if context.size == 0:
-                        continue
+            if z >= len(slice_lung_fraction) or slice_lung_fraction[z] < 0.015:
+                continue
 
-                    lung_fraction = float(np.mean(context < -300))
-                    soft_fraction = float(np.mean((context > -500) & (context < 250)))
-                    if lung_fraction < 0.08 or soft_fraction < 0.015:
-                        continue
+            # Screen the whole (y, x) grid for this slice in one vectorized
+            # pass instead of calling `_mask_fraction_near` (a Python
+            # function + numpy mean) once per grid point - for a full-size CT
+            # (hundreds of slices, 512x512) that inner loop used to run tens
+            # of thousands of times per scan and dominated analysis time.
+            # `_box_mean_grid` computes the exact same clamped-window mean,
+            # just for every grid point at once via a summed-area table.
+            fraction_grid = self._box_mean_grid(lung_masks[z], y_values, x_values, 12)
+            candidate_rows, candidate_columns = np.nonzero(fraction_grid >= 0.12)
+            if candidate_rows.size == 0:
+                continue
 
-                    candidates.append(
-                        {
-                            "center": (int(z), int(y), int(x)),
-                            "score": soft_fraction + lung_fraction * 0.15,
-                        }
-                    )
+            for row_idx, column_idx in zip(candidate_rows.tolist(), candidate_columns.tolist()):
+                y = y_values[row_idx]
+                x = x_values[column_idx]
+
+                z0, z1 = max(0, z - 1), min(z_count, z + 2)
+                y0, y1 = max(0, y - 24), min(rows, y + 24)
+                x0, x1 = max(0, x - 24), min(columns, x + 24)
+                context = volume[z0:z1, y0:y1, x0:x1]
+                lung_context = lung_masks[z0:z1, y0:y1, x0:x1]
+                if context.size == 0:
+                    continue
+
+                lung_fraction = float(np.mean(lung_context))
+                soft_fraction = float(np.mean((context > -650) & (context < 250)))
+                dense_fraction = float(np.mean((context > -300) & (context < 250)))
+                if lung_fraction < 0.04 or dense_fraction < 0.004 or soft_fraction > 0.45:
+                    continue
+
+                candidates.append(
+                    {
+                        "center": (int(z), int(y), int(x)),
+                        "score": dense_fraction + soft_fraction * 0.35 + lung_fraction * 0.2,
+                    }
+                )
 
         candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates[: self.config.max_candidates]
+
+    @staticmethod
+    def _box_mean_grid(mask: np.ndarray, y_values: range, x_values: range, radius: int) -> np.ndarray:
+        """Vectorized equivalent of calling `_mask_fraction_near(mask, y, x,
+        radius)` at every combination of `y_values` x `x_values` - returns a
+        2D array of shape (len(y_values), len(x_values)) with the same
+        clamped-window mean each individual call would return, computed via a
+        summed-area table so the whole grid costs a handful of numpy ops
+        instead of one Python call per point."""
+        rows, columns = mask.shape
+        integral = np.zeros((rows + 1, columns + 1), dtype=np.float64)
+        integral[1:, 1:] = mask.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+
+        y_arr = np.fromiter(y_values, dtype=np.int64, count=len(y_values))
+        x_arr = np.fromiter(x_values, dtype=np.int64, count=len(x_values))
+        y0 = np.clip(y_arr - radius, 0, rows)
+        y1 = np.clip(y_arr + radius, 0, rows)
+        x0 = np.clip(x_arr - radius, 0, columns)
+        x1 = np.clip(x_arr + radius, 0, columns)
+
+        y0g, y1g = y0[:, None], y1[:, None]
+        x0g, x1g = x0[None, :], x1[None, :]
+
+        total = integral[y1g, x1g] - integral[y0g, x1g] - integral[y1g, x0g] + integral[y0g, x0g]
+        area = (y1g - y0g) * (x1g - x0g)
+        return np.divide(total, area, out=np.zeros_like(total), where=area > 0)
+
+    def _build_lung_masks(self, volume: np.ndarray) -> np.ndarray:
+        masks = np.zeros(volume.shape, dtype=bool)
+
+        for z, image in enumerate(volume):
+            air = image < -450
+            if not np.any(air):
+                continue
+
+            outside_air = self._edge_connected_mask(air)
+            internal_air = air & ~outside_air
+            air_fraction = float(np.mean(air))
+            internal_fraction = float(np.mean(internal_air))
+
+            # Cropped test volumes and some exports may contain only lung pixels,
+            # so every air pixel touches the image edge. Treat those as lung-like.
+            if internal_fraction < 0.015 and air_fraction > 0.35:
+                internal_air = air
+                internal_fraction = air_fraction
+
+            if internal_fraction >= 0.015:
+                masks[z] = internal_air
+
+        return masks
+
+    # 4-connectivity structuring element (matches the up/down/left/right-only
+    # expansion the old BFS used - no diagonal moves).
+    _FOUR_CONNECTIVITY = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+
+    @classmethod
+    def _edge_connected_mask(cls, mask: np.ndarray) -> np.ndarray:
+        """Air pixels connected to the image border (4-connectivity) - i.e.
+        "outside" air like the space around the body, as opposed to air
+        pockets enclosed inside it (lungs).
+
+        Previously a hand-rolled Python BFS (a deque + one function call per
+        pixel) - on a full-size 512x512 slice that was slow enough to
+        dominate whole-CT analysis time (tens of seconds per scan just for
+        this step, run once per slice). `scipy.ndimage.label` does the same
+        4-connected flood fill in optimized C and returns identical results
+        (verified against the old BFS output pixel-for-pixel) in a fraction
+        of the time.
+        """
+        if not np.any(mask):
+            return np.zeros_like(mask, dtype=bool)
+
+        labeled, feature_count = ndimage.label(mask, structure=cls._FOUR_CONNECTIVITY)
+        if feature_count == 0:
+            return np.zeros_like(mask, dtype=bool)
+
+        border_labels = np.unique(
+            np.concatenate([labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]])
+        )
+        border_labels = border_labels[border_labels != 0]
+        if border_labels.size == 0:
+            return np.zeros_like(mask, dtype=bool)
+        return np.isin(labeled, border_labels)
+
+    @staticmethod
+    def _mask_fraction_near(mask: np.ndarray, y: int, x: int, radius: int) -> float:
+        y0, y1 = max(0, y - radius), min(mask.shape[0], y + radius)
+        x0, x1 = max(0, x - radius), min(mask.shape[1], x + radius)
+        window = mask[y0:y1, x0:x1]
+        return float(np.mean(window)) if window.size else 0.0
 
     def _fallback_candidates(self, volume: np.ndarray) -> list[dict]:
         z_count, rows, columns = volume.shape
@@ -231,7 +392,8 @@ class NoduleModel:
             dst_y0: dst_y0 + (src_y1 - src_y0),
             dst_x0: dst_x0 + (src_x1 - src_x0),
         ] = volume[src_z0:src_z1, src_y0:src_y1, src_x0:src_x1]
-        return patch
+        patch = np.clip(patch, -1000, 400)
+        return (patch + 1000) / 1400
 
     def _nms_3d(self, scored: list[dict]) -> list[dict]:
         kept: list[dict] = []
@@ -274,7 +436,11 @@ class NoduleModel:
             annotations.append(
                 {
                     "id": str(uuid.uuid4()),
+                    "title": "Подозрительный объект",
                     "source": "auto",
+                    "modelName": meta.get("modelName", "3D CNN"),
+                    "threshold": round(float(meta.get("threshold") or 0), 2),
+                    "probability": round(probability, 4),
                     "confidence": round(probability, 2),
                     "sliceIndex": int(z),
                     "x": rect["x"],
@@ -289,8 +455,9 @@ class NoduleModel:
         return annotations
 
     def _mock_analyze(self, payload: dict) -> list[dict]:
-        series = payload.get("series") or []
+        series = payload.get("series") or payload.get("slices") or []
         if not series:
+            self.last_probability = 0.0
             return []
 
         first = series[0]
@@ -319,12 +486,17 @@ class NoduleModel:
             y = rows * (0.20 + rng.random() * 0.58) - height / 2
             rect = self._clamp_rect(x, y, width, height, rows, columns)
             segment = self._estimate_segment(rect, rows, columns)
+            probability = 0.72 + rng.random() * 0.23
 
             annotations.append(
                 {
                     "id": str(uuid.uuid4()),
+                    "title": "Подозрительный объект",
                     "source": "auto",
-                    "confidence": round(0.72 + rng.random() * 0.23, 2),
+                    "modelName": "mock",
+                    "threshold": self.config.threshold,
+                    "probability": round(probability, 4),
+                    "confidence": round(probability, 2),
                     "sliceIndex": slice_index,
                     "x": rect["x"],
                     "y": rect["y"],
@@ -335,6 +507,7 @@ class NoduleModel:
                 }
             )
 
+        self.last_probability = max(item["probability"] for item in annotations)
         return sorted(annotations, key=lambda item: item["sliceIndex"])
 
     @staticmethod
@@ -359,8 +532,25 @@ class NoduleModel:
 
     @staticmethod
     def default_weights_path() -> str | None:
-        candidate = Path(__file__).resolve().parent / "weights" / "best_better3dcnn.pth"
-        return str(candidate) if candidate.exists() else None
+        candidates = [
+            os.getenv("MODEL_WEIGHTS_PATH"),
+            Path(__file__).resolve().parent / "weights" / "improved_3dcnn_checkpoint.pth",
+            Path("/Users/aidungmas/Desktop/MFDP/Models/improved_3dcnn_checkpoint.pth"),
+            Path(__file__).resolve().parent / "weights" / "best_better3dcnn.pth",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return str(candidate)
+        return None
+
+    @staticmethod
+    def _infer_model_name(state_dict: dict) -> str:
+        first_weight = state_dict.get("conv.0.weight")
+        fc_weight = state_dict.get("fc.1.weight")
+        if first_weight is not None and tuple(first_weight.shape) == (8, 1, 3, 3, 3):
+            if fc_weight is not None and tuple(fc_weight.shape) == (128, 2048):
+                return "Improved3DCNN"
+        return "Better3DCNN"
 
     @staticmethod
     def _clamp_rect(x: float, y: float, width: float, height: float, rows: int, columns: int) -> dict:
@@ -395,6 +585,47 @@ class NoduleModel:
             "short": f"{segment} {side}",
             "label": f"{segment} {side}, {lobe}",
         }
+
+
+def build_improved_3dcnn():
+    import torch.nn as nn
+
+    class Improved3DCNN(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv3d(1, 8, kernel_size=3, padding=1),
+                nn.GroupNorm(4, 8),
+                nn.LeakyReLU(0.1),
+                nn.Conv3d(8, 8, kernel_size=3, padding=1),
+                nn.GroupNorm(4, 8),
+                nn.LeakyReLU(0.1),
+                nn.MaxPool3d(2),
+                nn.Conv3d(8, 16, kernel_size=3, padding=1),
+                nn.GroupNorm(4, 16),
+                nn.LeakyReLU(0.1),
+                nn.Conv3d(16, 16, kernel_size=3, padding=1),
+                nn.GroupNorm(4, 16),
+                nn.LeakyReLU(0.1),
+                nn.MaxPool3d(2),
+                nn.Conv3d(16, 32, kernel_size=3, padding=1),
+                nn.GroupNorm(8, 32),
+                nn.LeakyReLU(0.1),
+                nn.MaxPool3d(2),
+            )
+            self.fc = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(32 * 4 * 4 * 4, 128),
+                nn.LeakyReLU(0.1),
+                nn.Dropout(0.2),
+                nn.Linear(128, 2),
+            )
+
+        def forward(self, x):
+            x = self.conv(x)
+            return self.fc(x)
+
+    return Improved3DCNN()
 
 
 def build_better_3dcnn():

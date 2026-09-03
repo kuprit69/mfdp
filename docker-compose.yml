@@ -1,25 +1,55 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      target: app
     ports:
-      - "8765:8765"
+      - "8775:8765"
     environment:
       MODEL_WORKERS: 2
-      DB_PATH: /app/data/app.sqlite3
+      DATABASE_URL: postgresql+psycopg://lung:lung@db:5432/lung_prometheus
+      REDIS_URL: redis://redis:6379/0
+      MODEL_WEIGHTS_PATH: /app/backend/weights/improved_3dcnn_checkpoint.pth
+      MODEL_DETECTION_THRESHOLD: 0.85
       REPORT_SERVICE_URL: http://report-api:8766/api/reports/generate
+      STUDY_FILES_DIR: /app/data/studies
     volumes:
-      - app-data:/app/data
+      - study-files:/app/data/studies
     depends_on:
+      - db
+      - redis
       - report-api
 
   report-api:
-    build: .
-    command: uvicorn backend.report_service:app --host 0.0.0.0 --port 8766
+    build:
+      context: .
+      target: report-api
     ports:
       - "8766:8766"
     environment:
       OLLAMA_URL: http://host.docker.internal:11434/api/generate
       OLLAMA_MODEL: llama3.1
 
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lung_prometheus
+      POSTGRES_USER: lung
+      POSTGRES_PASSWORD: lung
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
 volumes:
-  app-data:
+  pg-data:
+  redis-data:
+  study-files:

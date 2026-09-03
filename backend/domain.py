@@ -29,6 +29,18 @@ class Study:
 
 
 @dataclass
+class Patient:
+    full_name: str
+    birth_date: str = ""
+    patient_id: str = ""
+    id: str = field(default_factory=new_id)
+    created_at: str = field(default_factory=now_iso)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class Finding:
     study_id: str
     title: str

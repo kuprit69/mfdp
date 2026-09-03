@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>LungPrometheus</title>
-    <link rel="stylesheet" href="./styles.css?v=7">
+    <link rel="stylesheet" href="./styles.css?v=8">
   </head>
   <body>
     <header class="topbar">
@@ -63,10 +63,16 @@
     <main id="appLayout" class="layout hidden">
       <section class="panel history-panel">
         <div class="section-title">
-          <h1>История запросов</h1>
-          <span id="studyCount">0</span>
+          <h1>Пациенты</h1>
+          <span id="patientCount">0</span>
         </div>
-        <div id="studyList" class="study-list"></div>
+        <input id="patientSearch" type="search" class="study-search" placeholder="Поиск по ФИО, ID, дате рождения...">
+        <div id="patientList" class="study-list"></div>
+        <div id="patientPagination" class="study-pagination hidden">
+          <button id="patientPrevPageButton" type="button" class="compact">←</button>
+          <span id="patientPageLabel">Стр. 1 из 1</span>
+          <button id="patientNextPageButton" type="button" class="compact">→</button>
+        </div>
       </section>
 
       <section class="workspace">
@@ -86,6 +92,9 @@
           </div>
 
           <div id="viewer" class="viewer">
+            <div id="analysisProgress" class="analysis-progress hidden">
+              <div id="analysisProgressBar" class="analysis-progress-bar"></div>
+            </div>
             <canvas id="imageCanvas"></canvas>
             <canvas id="overlayCanvas"></canvas>
             <div id="modelStatus" class="model-status">Модель ожидает файл</div>
@@ -103,6 +112,29 @@
             <input id="zoomSlider" type="range" min="80" max="300" step="10" value="100">
             <button id="zoomInButton" type="button">+</button>
             <span id="zoomLabel">100%</span>
+            <button id="resetViewButton" type="button" class="compact" title="Сбросить масштаб и сдвиг">Сбросить вид</button>
+          </div>
+
+          <div class="wl-controls">
+            <div class="wl-presets">
+              <span class="wl-title">Окно (W/L):</span>
+              <button id="wlLungButton" type="button" class="compact">Легкие</button>
+              <button id="wlBoneButton" type="button" class="compact">Кости</button>
+              <button id="wlSoftButton" type="button" class="compact">Мягкие ткани</button>
+              <button id="wlAutoButton" type="button" class="compact">Авто</button>
+            </div>
+            <div class="wl-sliders">
+              <label>
+                Center
+                <input id="wlCenterSlider" type="range" min="-1200" max="1200" step="10" value="0">
+                <span id="wlCenterLabel">—</span>
+              </label>
+              <label>
+                Width
+                <input id="wlWidthSlider" type="range" min="1" max="4000" step="10" value="1">
+                <span id="wlWidthLabel">—</span>
+              </label>
+            </div>
           </div>
 
           <section>
@@ -116,7 +148,7 @@
           </section>
 
           <section id="reportPanel" class="report-panel hidden">
-            <h3>Заключение</h3>
+            <h3>Заключение <span id="reportSourceBadge" class="report-source-badge hidden"></span></h3>
             <textarea id="reportText" readonly></textarea>
           </section>
         </article>
@@ -124,30 +156,66 @@
 
       <aside class="panel upload-panel">
         <h1>Добавить файл</h1>
-        <form id="patientForm" class="form">
+
+        <div id="dropZone" class="drop-zone">
+          <p id="dropZoneHint" class="drop-zone-hint">Перетащите файл или папку сюда</p>
+          <div class="upload-actions">
+            <label class="upload-button">
+              <input id="fileInput" type="file" multiple accept=".mhd,.raw,.dcm,.dicom,image/*">
+              Загрузить файл
+            </label>
+            <label class="upload-button secondary">
+              <input id="folderInput" type="file" multiple webkitdirectory>
+              Загрузить папку
+            </label>
+          </div>
+        </div>
+
+        <div id="pendingUploadPanel" class="pending-upload hidden">
+          <p id="pendingUploadSummary" class="muted"></p>
+          <div class="form-actions">
+            <button id="addStudyButton" class="primary" type="button">Добавить исследование</button>
+            <button id="cancelPendingUploadButton" class="compact" type="button">Отмена</button>
+          </div>
+        </div>
+
+        <form id="patientForm" class="form hidden">
           <label>
             ФИО
             <input id="patientName" required placeholder="Иван Петров">
+            <span id="patientNameError" class="field-error"></span>
           </label>
           <label>
             Дата рождения
             <input id="birthDate" type="date" required>
+            <span id="birthDateError" class="field-error"></span>
           </label>
+          <div class="form-actions">
+            <button class="primary" type="submit">Продолжить</button>
+            <button id="backToPendingUploadButton" class="compact" type="button">Назад</button>
+          </div>
         </form>
 
-        <div class="upload-actions">
-          <label class="upload-button">
-            <input id="fileInput" type="file" multiple accept=".mhd,.raw,.dcm,.dicom,image/*">
-            Загрузить файл
-          </label>
-          <label class="upload-button secondary">
-            <input id="folderInput" type="file" multiple webkitdirectory>
-            Загрузить папку
-          </label>
+        <div id="patientMatchPrompt" class="patient-match-prompt hidden">
+          <p id="patientMatchText"></p>
+          <div class="form-actions">
+            <button id="useExistingPatientButton" class="primary" type="button">Добавить в карту</button>
+            <button id="createNewPatientButton" class="compact" type="button">Новый пациент</button>
+          </div>
         </div>
       </aside>
     </main>
 
-    <script src="./app.js?v=7"></script>
+    <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+    <div id="loadingOverlay" class="loading-overlay hidden" aria-live="polite">
+      <div class="loading-canvas-wrap">
+        <canvas id="loadingCanvas" class="loading-canvas"></canvas>
+        <div class="loading-scan-line"></div>
+      </div>
+      <p id="loadingCaptionText" class="loading-caption">Модель анализирует срезы</p>
+    </div>
+
+    <script src="./app.js?v=8"></script>
   </body>
 </html>

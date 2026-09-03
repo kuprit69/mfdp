@@ -6,3 +6,6 @@ __pycache__/
 data/
 *.sqlite3
 .pytest_cache/
+*.ipynb_checkpoints/
+backend/weights/*.pth
+!backend/weights/.gitkeep

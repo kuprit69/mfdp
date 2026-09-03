@@ -1,2 +1,8 @@
 fastapi
 uvicorn
+sqlalchemy
+psycopg[binary]
+redis
+numpy
+scipy
+bcrypt
